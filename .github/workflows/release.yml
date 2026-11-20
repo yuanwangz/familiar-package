@@ -1,0 +1,145 @@
+# Build Familiar for every platform and publish it to the public repository yuanwangz/familiar-package, where the
+# forkagent install scripts fetch it (releases/latest/download/<name>). Fixed names, no version in them:
+#   familiar-darwin-arm64.app.tar.gz   familiar-darwin-x64.app.tar.gz   Familiar.app (pets + its core), tar.gz;
+#                                       signed with our own certificate (dev/sign-macos.mjs), not notarized
+#   familiar-win32-x64-setup.exe        the NSIS installer, per user (%LOCALAPPDATA%\Familiar), /S for silent
+#   familiar-linux-x64.AppImage         familiar-linux-arm64.AppImage
+#   familiar-core-linux-x64             familiar-core-linux-arm64      the core alone (musl, static): servers with no display
+#   SHA256SUMS
+# The core inside each package: Familiar.app/Contents/MacOS/familiar-core; <install dir>\familiar-core.exe;
+# usr/bin/familiar-core in the AppImage (and in what --appimage-extract gives).
+# The same file runs in this repository (a v* tag push, or by hand) and in familiar-package (by hand, ref = a tag here):
+# it always builds yuanwangz/familiar at that ref and publishes only when the ref is a v* tag, all files at once after
+# every build passed (a release missing a platform would be `latest` for the install scripts).
+# Secrets: MACOS_SIGNING_PEM (key + certificate, see dev/sign-macos.mjs); in this repository PACKAGE_TOKEN (contents:
+# write on familiar-package); in familiar-package SOURCE_TOKEN (contents: read on this repository).
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'familiar ref to build (a v* tag publishes)'
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  REF: ${{ inputs.ref || github.ref_name }}
+
+jobs:
+  app:
+    # a tag pushed to familiar-package (its releases) is not a build request there
+    if: github.event_name == 'workflow_dispatch' || github.repository == 'yuanwangz/familiar'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin, label: darwin-arm64 }
+          - { os: macos-latest, target: x86_64-apple-darwin, label: darwin-x64 }   # cross-compiled on Apple silicon
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, label: win32-x64 }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, label: linux-x64 }   # the oldest glibc we run on
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, label: linux-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: yuanwangz/familiar
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN || github.token }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev patchelf
+      - run: npm ci
+      # the bundle targets are tauri.conf.json's (app / nsis / appimage, whichever this platform makes)
+      - run: npx tauri build --target ${{ matrix.target }}
+      - if: runner.os == 'macOS'
+        name: Sign
+        env:
+          MACOS_SIGNING_PEM: ${{ secrets.MACOS_SIGNING_PEM }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.29.0/apple-codesign-0.29.0-macos-universal.tar.gz | tar -xz -C "$RUNNER_TEMP"
+          RCODESIGN=$(echo "$RUNNER_TEMP"/apple-codesign-*/rcodesign) node dev/sign-macos.mjs target/${{ matrix.target }}/release/bundle/macos/Familiar.app
+      - name: Name it for the installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          b=target/${{ matrix.target }}/release/bundle
+          mkdir -p dist
+          case "${{ runner.os }}" in
+            macOS) tar -czf dist/familiar-${{ matrix.label }}.app.tar.gz -C $b/macos Familiar.app ;;
+            Windows) cp $b/nsis/*-setup.exe dist/familiar-${{ matrix.label }}-setup.exe ;;
+            Linux) cp $b/appimage/*.AppImage dist/familiar-${{ matrix.label }}.AppImage ;;
+          esac
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: familiar-${{ matrix.label }}
+          path: dist/*
+
+  core:
+    if: github.event_name == 'workflow_dispatch' || github.repository == 'yuanwangz/familiar'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, label: linux-x64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, label: linux-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: yuanwangz/familiar
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN || github.token }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: core-${{ matrix.target }}
+      - run: cargo build --release -p familiar-core --target ${{ matrix.target }}
+      - run: mkdir -p dist && cp target/${{ matrix.target }}/release/familiar-core dist/familiar-core-${{ matrix.label }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: familiar-core-${{ matrix.label }}
+          path: dist/*
+
+  publish:
+    needs: [app, core]
+    if: startsWith(inputs.ref || github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release on familiar-package
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGE_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+          R=yuanwangz/familiar-package
+          if gh release view "$REF" -R $R >/dev/null 2>&1; then
+            gh release upload "$REF" * -R $R --clobber
+          else
+            gh release create "$REF" * -R $R --title "Familiar $REF" --latest \
+              --notes "Built from yuanwangz/familiar $REF. Install through forkagent (devices: enroll). Not notarized; macOS builds carry our own signature."
+          fi
